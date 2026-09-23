@@ -106,6 +106,128 @@ func main() {
 		fail("race left %d grants, want exactly 1", n)
 	}
 
+	// ---- shared-grant upgrade sequence ---------------------------------
+
+	step("upgrade with a rival -> UPGRADE_PENDING; receiver is a barrier")
+	rx3 := "rx-verify-up-" + suffix()
+	up1, up1Tok := mustCreate(api1, rx3, "SHARED", http.StatusCreated)
+	up2, up2Tok := mustCreate(api2, rx3, "SHARED", http.StatusCreated)
+	upg := mustUpgrade(api1, up1.ID, up1Tok, http.StatusOK)
+	if upg.Status != "UPGRADE_PENDING" || upg.Mode != "SHARED" {
+		fail("want UPGRADE_PENDING SHARED, got %+v", upg)
+	}
+	// No new grants while an upgrade is queued.
+	mustCreate(api1, rx3, "SHARED", http.StatusConflict)
+	mustCreate(api2, rx3, "EXCLUSIVE", http.StatusConflict)
+	if gs := mustList(api2, rx3); len(gs) != 2 {
+		fail("barred admission must leave no record, got %d", len(gs))
+	}
+	// Exactly one waiter: a second upgrade (other grant, correct token) is
+	// rejected without changing the set.
+	mustUpgrade(api2, up2.ID, up2Tok, http.StatusConflict)
+	if g := findGrant(mustList(api1, rx3), up2.ID); g.Status != "ACTIVE" {
+		fail("second upgrade mutated the rival: %+v", g)
+	}
+	// Wrong token is forbidden and leaves the waiter pending.
+	mustUpgrade(api2, up1.ID, "forged", http.StatusForbidden)
+	if g := findGrant(mustList(api1, rx3), up1.ID); g.Status != "UPGRADE_PENDING" {
+		fail("forbidden upgrade mutated waiter: %+v", g)
+	}
+	// Replaying the same upgrade with the correct token is idempotent.
+	if g := mustUpgrade(api2, up1.ID, up1Tok, http.StatusOK); g.Status != "UPGRADE_PENDING" {
+		fail("idempotent pending upgrade returned %+v", g)
+	}
+
+	step("last rival releases -> waiter auto-promotes to ACTIVE EXCLUSIVE")
+	mustRelease(api2, up2.ID, up2Tok, http.StatusOK)
+	if g := findGrant(mustList(api1, rx3), up1.ID); g.Status != "ACTIVE" || g.Mode != "EXCLUSIVE" {
+		fail("waiter not promoted: %+v", g)
+	}
+	for _, g := range mustList(api2, rx3) {
+		if g.Status == "UPGRADE_PENDING" {
+			fail("intermediate UPGRADE_PENDING visible after promotion: %+v", g)
+		}
+	}
+	// Replay after promotion is idempotent and the original token still works.
+	if g := mustUpgrade(api1, up1.ID, up1Tok, http.StatusOK); g.Status != "ACTIVE" || g.Mode != "EXCLUSIVE" {
+		fail("upgrade replay after promotion: %+v", g)
+	}
+	mustRelease(api2, up1.ID, up1Tok, http.StatusOK)
+
+	step("releasing the waiter cancels the upgrade and reopens admission")
+	rx4 := "rx-verify-cancel-" + suffix()
+	cw, cwTok := mustCreate(api1, rx4, "SHARED", http.StatusCreated)
+	cr, _ := mustCreate(api2, rx4, "SHARED", http.StatusCreated)
+	mustUpgrade(api2, cw.ID, cwTok, http.StatusOK)
+	mustCreate(api1, rx4, "SHARED", http.StatusConflict)
+	mustRelease(api1, cw.ID, cwTok, http.StatusOK)
+	mustCreate(api2, rx4, "SHARED", http.StatusCreated)
+	mustUpgrade(api1, cw.ID, cwTok, http.StatusConflict) // released grant never upgrades
+	mustRelease(api2, cr.ID, "", http.StatusForbidden)   // sanity: still gated by token
+
+	step("native EXCLUSIVE grant can never be upgraded")
+	rx5 := "rx-verify-native-" + suffix()
+	nx, nxTok := mustCreate(api1, rx5, "EXCLUSIVE", http.StatusCreated)
+	mustUpgrade(api2, nx.ID, nxTok, http.StatusConflict)
+	mustUpgrade(api1, nx.ID, nxTok, http.StatusConflict)
+	if g := findGrant(mustList(api2, rx5), nx.ID); g.Status != "ACTIVE" || g.Mode != "EXCLUSIVE" {
+		fail("native exclusive mutated by upgrade: %+v", g)
+	}
+
+	step("concurrent upgrade race across both APIs yields exactly one waiter")
+	rx6 := "rx-verify-uprace-" + suffix()
+	const upContenders = 8
+	upClaims := make([]grant, 0, upContenders)
+	upToks := make([]string, 0, upContenders)
+	for i := 0; i < upContenders; i++ {
+		base := api1
+		if i%2 == 1 {
+			base = api2
+		}
+		g, tok := mustCreate(base, rx6, "SHARED", http.StatusCreated)
+		upClaims = append(upClaims, g)
+		upToks = append(upToks, tok)
+	}
+	upCodes := make(chan int, upContenders)
+	var upWG sync.WaitGroup
+	for i := range upClaims {
+		base := api1
+		if i%2 == 1 {
+			base = api2
+		}
+		upWG.Add(1)
+		go func(b, id, tok string) {
+			defer upWG.Done()
+			_, code := upgrade(b, id, tok)
+			upCodes <- code
+		}(base, upClaims[i].ID, upToks[i])
+	}
+	upWG.Wait()
+	close(upCodes)
+	upOK, upBusy := 0, 0
+	for code := range upCodes {
+		switch code {
+		case http.StatusOK:
+			upOK++
+		case http.StatusConflict:
+			upBusy++
+		default:
+			fail("upgrade race: unexpected status %d", code)
+		}
+	}
+	if upOK != 1 || upBusy != upContenders-1 {
+		fail("upgrade race: want 1 ok / %d busy, got %d / %d", upContenders-1, upOK, upBusy)
+	}
+	pending := 0
+	for _, g := range mustList(api1, rx6) {
+		if g.Status == "UPGRADE_PENDING" {
+			pending++
+		}
+	}
+	if pending != 1 {
+		fail("want exactly one pending waiter, got %d", pending)
+	}
+
 	step("query responses never leak tokens")
 	body := mustListRaw(api1, rx)
 	if strings.Contains(body, "token") || strings.Contains(body, tok1) {
@@ -208,6 +330,35 @@ func findGrant(grants []grant, id string) grant {
 	}
 	fail("grant %s missing from list", id)
 	return grant{}
+}
+
+func upgrade(base, id, token string) (grant, int) {
+	payload, _ := json.Marshal(map[string]string{"owner_token": token})
+	resp, err := client.Post(base+"/grants/"+id+"/upgrade", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		fail("upgrade: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "owner_token") {
+		fail("upgrade response leaks owner_token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return grant{}, resp.StatusCode
+	}
+	var g grant
+	if err := json.Unmarshal(body, &g); err != nil {
+		fail("upgrade: decode: %v", err)
+	}
+	return g, resp.StatusCode
+}
+
+func mustUpgrade(base, id, token string, want int) grant {
+	g, code := upgrade(base, id, token)
+	if code != want {
+		fail("upgrade %s: want %d, got %d", id, want, code)
+	}
+	return g
 }
 
 func mustRelease(base, id, token string, want int) grant {

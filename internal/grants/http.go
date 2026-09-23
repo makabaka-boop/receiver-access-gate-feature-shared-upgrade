@@ -19,6 +19,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /receivers/{receiver}/grants", s.handleCreate)
 	mux.HandleFunc("GET /receivers/{receiver}/grants", s.handleList)
 	mux.HandleFunc("POST /grants/{grant}/release", s.handleRelease)
+	mux.HandleFunc("POST /grants/{grant}/upgrade", s.handleUpgrade)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -97,6 +98,31 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "INTERNAL")
 	default:
+		writeJSON(w, http.StatusOK, g)
+	}
+}
+
+func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	var req releaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	g, err := s.store.UpgradeGrant(r.Context(), r.PathValue("grant"), req.OwnerToken)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+	case errors.Is(err, ErrForbidden):
+		writeError(w, http.StatusForbidden, "FORBIDDEN")
+	case errors.Is(err, ErrNotUpgradable):
+		writeError(w, http.StatusConflict, "NOT_UPGRADABLE")
+	case errors.Is(err, ErrAlreadyUpgrading):
+		writeError(w, http.StatusConflict, "ALREADY_UPGRADING")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "INTERNAL")
+	default:
+		// 200 (not 201): an existing grant is converted in place, no new
+		// token and no new record is created.
 		writeJSON(w, http.StatusOK, g)
 	}
 }
