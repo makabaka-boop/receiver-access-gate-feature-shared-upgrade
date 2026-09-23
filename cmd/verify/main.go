@@ -106,6 +106,143 @@ func main() {
 		fail("race left %d grants, want exactly 1", n)
 	}
 
+	step("shared grant upgrades in place: pending, idempotent retry, barrier")
+	rx3 := "rx-verify-upg-" + suffix()
+	s1, st1 := mustCreate(api1, rx3, "SHARED", http.StatusCreated)
+	s2, st2 := mustCreate(api2, rx3, "SHARED", http.StatusCreated)
+	s3, st3 := mustCreate(api1, rx3, "SHARED", http.StatusCreated)
+
+	step("upgrade with wrong token -> 403 FORBIDDEN, grant set unchanged")
+	mustUpgrade(api2, s1.ID, "forged-token", http.StatusForbidden)
+	for _, g := range mustList(api1, rx3) {
+		if g.Status != "ACTIVE" {
+			fail("forbidden upgrade mutated grant: %+v", g)
+		}
+	}
+
+	step("first upgrade wins the pending slot; retry is idempotent")
+	up := mustUpgrade(api1, s1.ID, st1, http.StatusOK)
+	if up.ID != s1.ID || up.Status != "UPGRADE_PENDING" || up.Mode != "SHARED" {
+		fail("upgrade: want same record UPGRADE_PENDING SHARED, got %+v", up)
+	}
+	if again := mustUpgrade(api2, s1.ID, st1, http.StatusOK); again.Status != "UPGRADE_PENDING" {
+		fail("idempotent retry: want UPGRADE_PENDING, got %+v", again)
+	}
+
+	step("second upgrade on the same receiver -> 409, no change")
+	mustUpgrade(api2, s2.ID, st2, http.StatusConflict)
+
+	step("pending upgrade bars new shared and exclusive admissions")
+	mustCreate(api1, rx3, "SHARED", http.StatusConflict)
+	mustCreate(api2, rx3, "EXCLUSIVE", http.StatusConflict)
+	if n := len(mustList(api1, rx3)); n != 3 {
+		fail("barrier must leave no record, got %d grants", n)
+	}
+
+	step("last competitor's release promotes the pending grant atomically")
+	mustRelease(api1, s2.ID, st2, http.StatusOK)
+	if got := findGrant(mustList(api2, rx3), s1.ID); got.Status != "UPGRADE_PENDING" {
+		fail("promoted too early: %+v", got)
+	}
+	mustRelease(api2, s3.ID, st3, http.StatusOK)
+	promoted := findGrant(mustList(api1, rx3), s1.ID)
+	if promoted.Mode != "EXCLUSIVE" || promoted.Status != "ACTIVE" {
+		fail("want promoted ACTIVE EXCLUSIVE, got %+v", promoted)
+	}
+	if got := findGrant(mustList(api2, rx3), s1.ID); got != promoted {
+		fail("promotion not consistent across APIs: %+v vs %+v", got, promoted)
+	}
+
+	step("upgrade retry after promotion is idempotent; original token still governs")
+	if again := mustUpgrade(api1, s1.ID, st1, http.StatusOK); again.Mode != "EXCLUSIVE" || again.Status != "ACTIVE" {
+		fail("retry after promotion: %+v", again)
+	}
+	mustCreate(api2, rx3, "SHARED", http.StatusConflict)
+
+	step("concurrent upgrade race across both APIs yields exactly one winner")
+	rx4 := "rx-verify-upgrace-" + suffix()
+	const upgraders = 8
+	upIDs := make([]string, upgraders)
+	upTokens := make([]string, upgraders)
+	for i := 0; i < upgraders; i++ {
+		base := api1
+		if i%2 == 1 {
+			base = api2
+		}
+		g, tok := mustCreate(base, rx4, "SHARED", http.StatusCreated)
+		upIDs[i], upTokens[i] = g.ID, tok
+	}
+	upResults := make(chan int, upgraders)
+	for i := 0; i < upgraders; i++ {
+		base := api1
+		if i%2 == 0 {
+			base = api2
+		}
+		wg.Add(1)
+		go func(b, id, tok string) {
+			defer wg.Done()
+			_, code, _ := upgrade(b, id, tok)
+			upResults <- code
+		}(base, upIDs[i], upTokens[i])
+	}
+	wg.Wait()
+	close(upResults)
+	won, lost := 0, 0
+	for code := range upResults {
+		switch code {
+		case http.StatusOK:
+			won++
+		case http.StatusConflict:
+			lost++
+		default:
+			fail("unexpected upgrade race status %d", code)
+		}
+	}
+	if won != 1 || lost != upgraders-1 {
+		fail("upgrade race: want 1 winner / %d losers, got %d / %d", upgraders-1, won, lost)
+	}
+	winner := ""
+	for _, g := range mustList(api1, rx4) {
+		if g.Status == "UPGRADE_PENDING" {
+			if winner != "" {
+				fail("multiple pending upgrades survived the race")
+			}
+			winner = g.ID
+		}
+	}
+	if winner == "" {
+		fail("upgrade race left no pending winner")
+	}
+	for i, id := range upIDs {
+		if id != winner {
+			mustRelease(api1, id, upTokens[i], http.StatusOK)
+		}
+	}
+	if got := findGrant(mustList(api2, rx4), winner); got.Mode != "EXCLUSIVE" || got.Status != "ACTIVE" {
+		fail("race winner not promoted after releases: %+v", got)
+	}
+
+	step("releasing the pending grant cancels the upgrade and lifts the barrier")
+	rx5 := "rx-verify-upgcancel-" + suffix()
+	c1, ct1 := mustCreate(api1, rx5, "SHARED", http.StatusCreated)
+	mustCreate(api2, rx5, "SHARED", http.StatusCreated)
+	if g := mustUpgrade(api1, c1.ID, ct1, http.StatusOK); g.Status != "UPGRADE_PENDING" {
+		fail("want UPGRADE_PENDING, got %+v", g)
+	}
+	mustCreate(api2, rx5, "SHARED", http.StatusConflict)
+	mustRelease(api1, c1.ID, ct1, http.StatusOK)
+	mustCreate(api2, rx5, "SHARED", http.StatusCreated)
+
+	step("upgrade rejects native exclusive, released and unknown grants")
+	rx6 := "rx-verify-upgerr-" + suffix()
+	x1, xt1 := mustCreate(api1, rx6, "EXCLUSIVE", http.StatusCreated)
+	mustUpgrade(api2, x1.ID, xt1, http.StatusConflict)
+	rx7 := "rx-verify-upgrel-" + suffix()
+	r1, rt1 := mustCreate(api1, rx7, "SHARED", http.StatusCreated)
+	mustRelease(api1, r1.ID, rt1, http.StatusOK)
+	mustUpgrade(api2, r1.ID, rt1, http.StatusConflict)
+	mustUpgrade(api1, "00000000000000000000000000000000", "tok", http.StatusNotFound)
+
 	step("query responses never leak tokens")
 	body := mustListRaw(api1, rx)
 	if strings.Contains(body, "token") || strings.Contains(body, tok1) {
@@ -230,6 +367,35 @@ func mustRelease(base, id, token string, want int) grant {
 	var g grant
 	if err := json.Unmarshal(body, &g); err != nil {
 		fail("release: decode: %v", err)
+	}
+	return g
+}
+
+func upgrade(base, id, token string) (grant, int, string) {
+	payload, _ := json.Marshal(map[string]string{"owner_token": token})
+	resp, err := client.Post(base+"/grants/"+id+"/upgrade", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		fail("upgrade: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "owner_token") {
+		fail("upgrade response leaks owner_token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return grant{}, resp.StatusCode, string(body)
+	}
+	var g grant
+	if err := json.Unmarshal(body, &g); err != nil {
+		fail("upgrade: decode: %v", err)
+	}
+	return g, resp.StatusCode, string(body)
+}
+
+func mustUpgrade(base, id, token string, want int) grant {
+	g, code, body := upgrade(base, id, token)
+	if code != want {
+		fail("upgrade %s: want %d, got %d (%s)", id, want, code, body)
 	}
 	return g
 }

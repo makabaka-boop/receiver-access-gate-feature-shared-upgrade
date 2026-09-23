@@ -19,6 +19,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /receivers/{receiver}/grants", s.handleCreate)
 	mux.HandleFunc("GET /receivers/{receiver}/grants", s.handleList)
 	mux.HandleFunc("POST /grants/{grant}/release", s.handleRelease)
+	mux.HandleFunc("POST /grants/{grant}/upgrade", s.handleUpgrade)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -94,6 +95,35 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND")
 	case errors.Is(err, ErrForbidden):
 		writeError(w, http.StatusForbidden, "FORBIDDEN")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "INTERNAL")
+	default:
+		writeJSON(w, http.StatusOK, g)
+	}
+}
+
+type upgradeRequest struct {
+	OwnerToken string `json:"owner_token"`
+}
+
+func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	var req upgradeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	g, err := s.store.UpgradeGrant(r.Context(), r.PathValue("grant"), req.OwnerToken)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "NOT_FOUND")
+	case errors.Is(err, ErrForbidden):
+		writeError(w, http.StatusForbidden, "FORBIDDEN")
+	case errors.Is(err, ErrReleased):
+		writeError(w, http.StatusConflict, "RELEASED")
+	case errors.Is(err, ErrNotShared):
+		writeError(w, http.StatusConflict, "NOT_SHARED")
+	case errors.Is(err, ErrUpgradePending):
+		writeError(w, http.StatusConflict, "UPGRADE_PENDING")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "INTERNAL")
 	default:

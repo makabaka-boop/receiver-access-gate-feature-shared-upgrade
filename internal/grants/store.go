@@ -21,6 +21,12 @@ const (
 
 	StatusActive   = "ACTIVE"
 	StatusReleased = "RELEASED"
+	// StatusUpgradePending marks a shared grant whose owner has requested
+	// an in-place upgrade to exclusive. While any grant on a receiver is
+	// in this state, new SHARED and EXCLUSIVE requests for that receiver
+	// are refused; the pending grant is promoted to ACTIVE EXCLUSIVE by
+	// the release that removes its last competitor.
+	StatusUpgradePending = "UPGRADE_PENDING"
 )
 
 var (
@@ -32,6 +38,17 @@ var (
 	ErrForbidden = errors.New("forbidden")
 	// ErrNotFound reports an unknown grant identifier.
 	ErrNotFound = errors.New("not found")
+	// ErrReleased reports an upgrade attempt on an already released
+	// grant. Nothing is modified.
+	ErrReleased = errors.New("released")
+	// ErrNotShared reports an upgrade attempt on a grant that is not an
+	// active shared grant (a natively exclusive grant). Nothing is
+	// modified.
+	ErrNotShared = errors.New("not shared")
+	// ErrUpgradePending reports that another grant on the receiver is
+	// already waiting for promotion. At most one pending upgrade exists
+	// per receiver; the losing attempt changes nothing.
+	ErrUpgradePending = errors.New("upgrade pending")
 )
 
 // Grant is the public view of one access grant. It never carries the owner
@@ -81,11 +98,29 @@ CREATE TABLE IF NOT EXISTS grants (
     id           TEXT        NOT NULL UNIQUE,
     receiver     TEXT        NOT NULL,
     mode         TEXT        NOT NULL CHECK (mode IN ('SHARED', 'EXCLUSIVE')),
-    status       TEXT        NOT NULL CHECK (status IN ('ACTIVE', 'RELEASED')),
+    status       TEXT        NOT NULL,
     token_digest BYTEA       NOT NULL,
+    upgraded_from_shared BOOLEAN NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     released_at  TIMESTAMPTZ
 )`); err != nil {
+			return err
+		}
+		// Upgrade databases created before upgrades existed: old records
+		// gain the column with its default and the status check is
+		// widened to admit UPGRADE_PENDING. Both statements are
+		// idempotent, so fresh databases pass through harmlessly.
+		if _, err := tx.Exec(ctx, `
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS upgraded_from_shared BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+ALTER TABLE grants DROP CONSTRAINT IF EXISTS grants_status_check`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+ALTER TABLE grants ADD CONSTRAINT grants_status_check
+CHECK (status IN ('ACTIVE', 'UPGRADE_PENDING', 'RELEASED'))`); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `
@@ -107,13 +142,15 @@ func (s *Store) CreateGrant(ctx context.Context, receiver, mode string) (Grant, 
 			return err
 		}
 		// A SHARED request conflicts with any active EXCLUSIVE grant; an
-		// EXCLUSIVE request conflicts with any active grant at all.
+		// EXCLUSIVE request conflicts with any active grant at all. A
+		// pending upgrade bars every new admission to the receiver, so
+		// the waiting owner is not starved by newcomers.
 		var conflicts int
 		if err := tx.QueryRow(ctx, `
 SELECT count(*) FROM grants
 WHERE receiver = $1
-  AND status = 'ACTIVE'
-  AND ($2 = 'EXCLUSIVE' OR mode = 'EXCLUSIVE')`,
+  AND (status = 'UPGRADE_PENDING'
+       OR (status = 'ACTIVE' AND ($2 = 'EXCLUSIVE' OR mode = 'EXCLUSIVE')))`,
 			receiver, mode).Scan(&conflicts); err != nil {
 			return err
 		}
@@ -162,21 +199,29 @@ ORDER BY seq`, receiver)
 	})
 }
 
-// ReleaseGrant transitions an ACTIVE grant to RELEASED when presented with
-// its owner token. A wrong token yields ErrForbidden and leaves both the
-// record and the receiver's active set untouched.
+// ReleaseGrant transitions an ACTIVE or UPGRADE_PENDING grant to RELEASED
+// when presented with its owner token. A wrong token yields ErrForbidden
+// and leaves both the record and the receiver's active set untouched.
+//
+// The release runs inside the receiver's serialization transaction: if a
+// pending upgrade survives on the receiver and the released grant was its
+// last competitor, the pending grant is promoted to ACTIVE EXCLUSIVE in
+// the same commit, so no query can observe an intermediate state.
+// Releasing the pending grant itself cancels the upgrade and lifts the
+// admission barrier.
 func (s *Store) ReleaseGrant(ctx context.Context, id, token string) (Grant, error) {
 	var g Grant
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		receiver, err := lockReceiver(ctx, tx, id)
+		if err != nil {
+			return err
+		}
 		var digest []byte
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 SELECT id, receiver, mode, status, token_digest
 FROM grants WHERE id = $1
 FOR UPDATE`, id).
 			Scan(&g.ID, &g.Receiver, &g.Mode, &g.Status, &digest)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
 		if err != nil {
 			return err
 		}
@@ -185,20 +230,154 @@ FOR UPDATE`, id).
 		if subtle.ConstantTimeCompare(sum[:], digest) != 1 {
 			return ErrForbidden // rollback: record and active set unchanged
 		}
-		if g.Status == StatusActive {
-			if _, err := tx.Exec(ctx, `
+		if g.Status == StatusReleased {
+			return nil // idempotent re-release
+		}
+		if _, err := tx.Exec(ctx, `
 UPDATE grants SET status = 'RELEASED', released_at = now()
 WHERE id = $1`, id); err != nil {
-				return err
-			}
-			g.Status = StatusReleased
+			return err
 		}
-		return nil
+		g.Status = StatusReleased
+		return promotePendingLocked(ctx, tx, receiver)
 	})
 	if err != nil {
 		return Grant{}, err
 	}
 	return g, nil
+}
+
+// UpgradeGrant converts an ACTIVE SHARED grant into the receiver's
+// exclusive grant in place: the record is kept, the owner token stays
+// valid, and no RELEASED/created pair is ever visible.
+//
+// If no other active grant remains on the receiver, the grant is promoted
+// to ACTIVE EXCLUSIVE immediately. Otherwise it becomes UPGRADE_PENDING:
+// the receiver stops admitting new grants, and the release of the last
+// competing grant promotes it. Repeating the call with the same token is
+// idempotent, both while waiting and after promotion.
+func (s *Store) UpgradeGrant(ctx context.Context, id, token string) (Grant, error) {
+	var g Grant
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		receiver, err := lockReceiver(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		var digest []byte
+		var upgraded bool
+		err = tx.QueryRow(ctx, `
+SELECT id, receiver, mode, status, token_digest, upgraded_from_shared
+FROM grants WHERE id = $1
+FOR UPDATE`, id).
+			Scan(&g.ID, &g.Receiver, &g.Mode, &g.Status, &digest, &upgraded)
+		if err != nil {
+			return err
+		}
+
+		sum := sha256.Sum256([]byte(token))
+		if subtle.ConstantTimeCompare(sum[:], digest) != 1 {
+			return ErrForbidden // rollback: grant set unchanged
+		}
+		switch {
+		case g.Status == StatusReleased:
+			return ErrReleased
+		case g.Status == StatusUpgradePending:
+			return nil // idempotent retry of a waiting upgrade
+		case upgraded:
+			return nil // idempotent retry after promotion to EXCLUSIVE
+		case g.Mode == ModeExclusive:
+			return ErrNotShared
+		}
+
+		// At most one pending upgrade per receiver.
+		var pending int
+		if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM grants
+WHERE receiver = $1 AND status = 'UPGRADE_PENDING'`, receiver).Scan(&pending); err != nil {
+			return err
+		}
+		if pending > 0 {
+			return ErrUpgradePending
+		}
+
+		// Competing active grants keep the upgrade waiting; with none
+		// left the grant is promoted straight to ACTIVE EXCLUSIVE.
+		var others int
+		if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM grants
+WHERE receiver = $1 AND id <> $2 AND status = 'ACTIVE'`,
+			receiver, id).Scan(&others); err != nil {
+			return err
+		}
+		if others == 0 {
+			return tx.QueryRow(ctx, `
+UPDATE grants
+SET mode = 'EXCLUSIVE', status = 'ACTIVE', upgraded_from_shared = TRUE
+WHERE id = $1
+RETURNING id, receiver, mode, status`, id).
+				Scan(&g.ID, &g.Receiver, &g.Mode, &g.Status)
+		}
+		return tx.QueryRow(ctx, `
+UPDATE grants SET status = 'UPGRADE_PENDING'
+WHERE id = $1
+RETURNING id, receiver, mode, status`, id).
+			Scan(&g.ID, &g.Receiver, &g.Mode, &g.Status)
+	})
+	if err != nil {
+		return Grant{}, err
+	}
+	return g, nil
+}
+
+// lockReceiver resolves the grant's receiver and takes the per-receiver
+// advisory transaction lock shared by every mutating operation. The row
+// is read without a lock first so that lock ordering is always
+// "advisory lock, then row locks", which keeps concurrent operations on
+// one receiver deadlock-free. It returns ErrNotFound for unknown ids.
+func lockReceiver(ctx context.Context, tx pgx.Tx, id string) (string, error) {
+	var receiver string
+	err := tx.QueryRow(ctx, `SELECT receiver FROM grants WHERE id = $1`, id).Scan(&receiver)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, receiver); err != nil {
+		return "", err
+	}
+	return receiver, nil
+}
+
+// promotePendingLocked promotes the receiver's pending upgrade to ACTIVE
+// EXCLUSIVE when no competing grant remains. The caller must hold the
+// per-receiver advisory lock inside the current transaction.
+func promotePendingLocked(ctx context.Context, tx pgx.Tx, receiver string) error {
+	var pendingID string
+	err := tx.QueryRow(ctx, `
+SELECT id FROM grants
+WHERE receiver = $1 AND status = 'UPGRADE_PENDING'`, receiver).Scan(&pendingID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var others int
+	if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM grants
+WHERE receiver = $1 AND id <> $2 AND status IN ('ACTIVE', 'UPGRADE_PENDING')`,
+		receiver, pendingID).Scan(&others); err != nil {
+		return err
+	}
+	if others > 0 {
+		return nil
+	}
+	_, err = tx.Exec(ctx, `
+UPDATE grants
+SET mode = 'EXCLUSIVE', status = 'ACTIVE', upgraded_from_shared = TRUE
+WHERE id = $1`, pendingID)
+	return err
 }
 
 func newID() (string, error) {
